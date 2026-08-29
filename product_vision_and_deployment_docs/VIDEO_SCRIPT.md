@@ -38,13 +38,19 @@
 
 ---
 
-## [2:15–2:45] Why This Matters (screen share: heat zone alerts panel)
+## [2:15–2:35] Who This Is For (screen share: heat zone alerts panel)
 
-> The whole point of ARGUS is turning a wall of raw temperature numbers into something an emergency planner can act on in seconds: which zone is hottest, how dangerous is it really, is it getting worse, and what should we do about it. That's the Discover-Investigate-Understand-Respond loop, running autonomously, across the whole country.
+> This is built for city emergency-management officials and public-health departments — the people who decide where to open a cooling center or issue a heat advisory. Today they usually act only after 911 calls spike. ARGUS turns raw temperature numbers into a decision they can act on in seconds — which zone is hottest, how dangerous, what to do — while it's still just an anomaly, not yet an incident.
 
 ---
 
-## [2:45–3:00] Close (on camera)
+## [2:35–2:50] Where This Goes Next — Thermal Brain (on camera or a simple slide)
+
+> ARGUS's engine doesn't know anything about "emergency planning" specifically — it just takes a polygon and a danger threshold and produces a scored, explained anomaly. That means the same engine can drive other domains without a rebuild: building energy load prediction, OSHA worker-safety alerts for outdoor crews, government policy dashboards, even training data for custom heat-prediction models. We call that broader direction **Thermal Brain** — one agentic core, many domain lenses. What you just saw is that core, fully working, end to end.
+
+---
+
+## [2:50–3:00] Close (on camera)
 
 > That's ARGUS — built end-to-end for this hackathon on top of the FortyGuard Temperature API and Groq. Repo link and live demo are in the submission. Thanks for watching.
 
