@@ -62,8 +62,8 @@ export function Dashboard() {
         cityId={cityId}
         cityName={cityLabel}
         anomalyCount={list.length}
-        maxSeverity={agentStatus?.max_severity}
-        lastScanMeta={meta}
+        maxSeverity={city?.max_severity ?? undefined}
+        lastScanMeta={meta ?? undefined}
       />
 
       {/* Explore FortyGuard directly first — decide what params actually return data for this
