@@ -10,8 +10,39 @@ LOGS_DIR = REPO_ROOT / "logs"
 
 
 def _configure() -> None:
-    (LOGS_DIR / "app").mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "audit").mkdir(parents=True, exist_ok=True)
+    # Serverless platforms (Vercel, Lambda) ship a read-only filesystem outside /tmp — file
+    # logging there just crashes at import time. They already capture stdout/stderr as logs,
+    # so fall back to console-only instead of failing the whole app.
+    file_logging_available = True
+    try:
+        (LOGS_DIR / "app").mkdir(parents=True, exist_ok=True)
+        (LOGS_DIR / "audit").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        file_logging_available = False
+
+    app_handlers = ["console", "app_file"] if file_logging_available else ["console"]
+    audit_handlers = ["console", "audit_file"] if file_logging_available else ["console"]
+
+    handlers = {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "level": LOG_LEVEL,
+        },
+    }
+    if file_logging_available:
+        handlers["app_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "default",
+            "filename": str(LOGS_DIR / "app" / "app.log"),
+            "maxBytes": 5_000_000,
+            "backupCount": 3,
+        }
+        handlers["audit_file"] = {
+            "class": "logging.FileHandler",
+            "formatter": "default",
+            "filename": str(LOGS_DIR / "audit" / "audit.log"),
+        }
 
     logging.config.dictConfig(
         {
@@ -22,33 +53,15 @@ def _configure() -> None:
                     "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
                 },
             },
-            "handlers": {
-                "console": {
-                    "class": "logging.StreamHandler",
-                    "formatter": "default",
-                    "level": LOG_LEVEL,
-                },
-                "app_file": {
-                    "class": "logging.handlers.RotatingFileHandler",
-                    "formatter": "default",
-                    "filename": str(LOGS_DIR / "app" / "app.log"),
-                    "maxBytes": 5_000_000,
-                    "backupCount": 3,
-                },
-                "audit_file": {
-                    "class": "logging.FileHandler",
-                    "formatter": "default",
-                    "filename": str(LOGS_DIR / "audit" / "audit.log"),
-                },
-            },
+            "handlers": handlers,
             "loggers": {
                 "argus.app": {
-                    "handlers": ["console", "app_file"],
+                    "handlers": app_handlers,
                     "level": LOG_LEVEL,
                     "propagate": False,
                 },
                 "argus.audit": {
-                    "handlers": ["console", "audit_file"],
+                    "handlers": audit_handlers,
                     "level": "INFO",
                     "propagate": False,
                 },
