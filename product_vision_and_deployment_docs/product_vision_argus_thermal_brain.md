@@ -44,7 +44,7 @@
 | **Builder** | Solo |
 | **Backend** | Python (FastAPI) |
 | **Frontend** | React (Next.js) or HTML/JS with Mapbox/Deck.gl |
-| **AI Layer** | Claude API / OpenAI API for reasoning + custom anomaly detection |
+| **AI Layer** | Groq (`openai/gpt-oss-120b`) for reasoning + custom anomaly detection |
 
 ---
 
@@ -72,14 +72,14 @@
 │  │ API Client │  │ Detector   │  │ Reasoner   │  │ Data APIs  │   │
 │  └────────────┘  └────────────┘  └────────────┘  └────────────┘   │
 │  ┌────────────────────────────────────────────────────────────────┐ │
-│  │          DATABASE (SQLite/PostgreSQL) + CACHE (Redis)          │ │
+│  │                     DATABASE (MongoDB)                          │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
            ▼                    ▼                    ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────┐
-│  FortyGuard API  │ │  OpenStreetMap   │ │  LLM API (Claude/GPT)   │
-│  Temperature     │ │  Overpass API    │ │  Reasoning + Reports     │
-│  Intelligence    │ │  Infrastructure  │ │  Natural Language        │
+│  FortyGuard API  │ │  OpenStreetMap   │ │  Groq API                │
+│  Temperature     │ │  Overpass API    │ │  openai/gpt-oss-120b     │
+│  Intelligence    │ │  Infrastructure  │ │  Reasoning + Reports     │
 └──────────────────┘ └──────────────────┘ └──────────────────────────┘
 ```
 
@@ -87,22 +87,32 @@
 
 ## 3. FortyGuard API — Complete Integration Map
 
+> **Confirmed live against the real API on 2026-08-22** — see `fortyguard_heat_intelligence_api.md`
+> for the authoritative, endpoint-by-endpoint reference and `backend/scripts/` for the
+> verification scripts. This section summarizes; that doc is the source of truth.
+
 **Base URL:** `https://api.fortyguard.com`
 
 **Authentication:** Header `api-key: YOUR_API_KEY`
 
-**Pattern:** Asynchronous submit-and-poll. You POST a request, get an `activity_id`, then poll until the result is ready.
+**Pattern:** Asynchronous submit-and-poll. You POST a request, get an `activity_id`, then poll
+`GET /v1/status/{activity_id}` — a single flat endpoint shared by every job type — until the
+result is ready.
 
-### 3.1 — Endpoint Map
+### 3.1 — Endpoint Map (real paths — several differ from the docs UI's section headings)
 
-| # | Endpoint | Method | Purpose | ARGUS Stage |
-|---|---|---|---|---|
-| 1 | `/v1/heatmap` | POST | Submit a heatmap generation request for a polygon area | DISCOVER |
-| 2 | `/v1/heatmap/status/{activity_id}` | GET | Poll processing status of a submitted job | ALL (polling) |
-| 3 | `/v1/heatmap/snapshot` | GET/POST | Point-in-time temperature grid — "what's the temp NOW" | DISCOVER |
-| 4 | `/v1/heatmap/exceedance` | GET/POST | Where does temperature exceed a threshold — "where is it dangerously hot" | DISCOVER + INVESTIGATE |
-| 5 | `/v1/heatmap/persistence` | GET/POST | How long has extreme heat persisted — "how many hours above danger level" | INVESTIGATE |
-| 6 | `/v1/heat-intelligence` | POST | Point-specific intelligence report with 5 contextual layers | INVESTIGATE + UNDERSTAND |
+| # | Endpoint | Purpose | ARGUS Stage |
+|---|---|---|---|
+| 1 | `POST /v1/heatmap` | Temperature snapshot, exceedance, or persistence — selected via `analytic_type` | DISCOVER + INVESTIGATE |
+| 2 | `GET /v1/status/{activity_id}` | Poll any job — one flat path for all endpoints | ALL (polling) |
+| 3 | `POST /v1/env_params` | Heat index, humidity, air quality, solar irradiance for a point | INVESTIGATE |
+| 4 | `POST /v1/satellite` | Land-cover segmentation (building/road/vegetation %) — Premium | INVESTIGATE |
+| 5 | `POST /v1/streetview` | Ground-level segmentation — Premium, not yet used | (available) |
+| 6 | `POST /v1/heat_intelligence` | Generates a downloadable PDF report — slow (minutes), not used live | (available) |
+
+There is **no separate exceedance or persistence endpoint** — that was an early, incorrect
+assumption. Both are `POST /v1/heatmap` with `analytic_type: "exceedance"` /
+`"persistence"` and a `threshold` (°C) + `direction` field.
 
 ### 3.2 — Heatmap Request Payload
 
@@ -119,21 +129,28 @@
         ]]
     },
     "date_time": {
-        "start_date": "2026-08-22",   # YYYY-MM-DD
-        "start_time": "14:00",        # HH:MM (24h)
-        "filter_type": 1              # 1=real-time, 2=historical, 3=predictive
+        "start_date": "2025-07-15",   # YYYY-MM-DD, 2019-01-01 through 12h ahead of now
+        "start_time": "14:00",        # HH:MM (24h) — required for filter_type 1/2
+        "filter_type": 1              # request TIME STRUCTURE — see 3.3, not real-time/historical/predictive
     },
-    "granularity": 100                # spatial resolution (meters per grid cell)
+    "granularity": 60,                # must be exactly 60, 80, or 100 (meters)
+    "analytic_type": "tcm",           # "tcm" (default) | "exceedance" | "persistence"
+    "threshold": 30,                  # °C — ignored by tcm
+    "direction": "above"              # "above" | "below" — ignored by tcm
 }
 ```
 
-### 3.3 — filter_type Values
+### 3.3 — filter_type Values (the request's time STRUCTURE, not a real-time/historical/predictive flag)
 
-| filter_type | Mode | Description | Use Case |
-|---|---|---|---|
-| `1` | **Real-time** | Current/near-real-time temperature data | Live monitoring, anomaly detection |
-| `2` | **Historical** | Past temperature patterns | Trend analysis, baseline computation |
-| `3` | **Predictive** | AI-forecasted future heat distribution | Early warning, proactive planning |
+| filter_type | Structure | Requires |
+|---|---|---|
+| `1` | Single Hour | `start_date` + `start_time` |
+| `2` | Range of Hours (same day) | `start_date` + `start_time` + `end_time` |
+| `3` | Single Day (00:00–23:59) | `start_date` only |
+| `4` | Range of Days (≤1 month) | `start_date` + `end_date` |
+
+Whether a result is "real-time," "historical," or a forecast is purely a function of how
+`start_date` compares to now — there's no dedicated flag for it.
 
 ### 3.4 — Response Pattern (Async)
 
@@ -146,52 +163,50 @@ response = requests.post(
 )
 activity_id = response.json()["data"]["activity_id"]
 
-# Step 2: Poll
+# Step 2: Poll — flat status endpoint, shared by every job type
 while True:
     status = requests.get(
-        f"https://api.fortyguard.com/v1/heatmap/status/{activity_id}",
+        f"https://api.fortyguard.com/v1/status/{activity_id}",
         headers={"api-key": API_KEY}
     )
     result = status.json()
-    if result["data"]["status"] == "completed":
+    if result["data"]["status"] == "Completed":
         heatmap_data = result["data"]["result"]
         break
-    time.sleep(2)  # wait before next poll
+    time.sleep(5)
 ```
 
-### 3.5 — Analysis Layer Selection (Critical)
+### 3.5 — Analysis Layer Selection
 
-From Fawad Shah's mentor session — **choosing the wrong layer gives confident wrong answers.**
+| Question You're Asking | Correct Layer |
+|---|---|
+| "How hot is it right now across this zone?" | `analytic_type=tcm` |
+| "How many hours has it been above threshold?" | `analytic_type=exceedance` or `persistence` (result values are **hours**, not °C) |
+| "What's the full environmental context at this point?" | `POST /v1/env_params` — heat index, humidity, air quality |
+| "What does the surface look like here?" | `POST /v1/satellite` — real land-cover % (Premium) |
+| "Generate a shareable report for this location?" | `POST /v1/heat_intelligence` — PDF, takes minutes |
 
-| Question You're Asking | Correct Layer | Wrong Layer |
-|---|---|---|
-| "How hot is it right now across this zone?" | **Snapshot** | Exceedance (tells you where it's hot, not how hot) |
-| "Where is it dangerously hot (above threshold)?" | **Exceedance** | Snapshot (gives raw temps, no threshold context) |
-| "How long has this been going on?" | **Persistence** | Snapshot (only shows current moment) |
-| "What's the full story of this specific location?" | **Heat Intelligence** | Heatmap (gives grid, not point-level depth) |
-| "What will tomorrow look like?" | **Snapshot (filter_type=3)** | Historical (shows past, not future) |
+### 3.6 — Heat Intelligence — Not What Earlier Drafts Assumed
 
-### 3.6 — Heat Intelligence Report — 5 Contextual Layers
+`POST /v1/heat_intelligence` (underscore — the docs UI heading is misleading) takes
+`{latitude, longitude, temperature (°F), date, analysis: [...]}` and does **not** return 5
+contextual layers as inline JSON. It generates a **downloadable PDF** —
+`result.download_link` once `Completed`. Confirmed live: still `Processing` after 5+ minutes.
+Too slow for a synchronous pipeline step — ARGUS's INVESTIGATE stage gets its "5 layers"
+equivalent from **`/v1/env_params`** (real-time environmental context) and **`/v1/satellite`**
+(real surface composition) instead, both of which complete in seconds.
 
-When you call `/v1/heat-intelligence` for a specific coordinate, you get:
-
-1. **Temperature Data** — Current, historical, and predicted temperature at that point
-2. **Land Use Context** — What type of urban environment surrounds this point
-3. **Surface Analysis** — Material composition, albedo, vegetation density
-4. **Risk Assessment** — Heat risk level, vulnerability indicators
-5. **Comparative Context** — How this point compares to surrounding areas
-
-### 3.7 — API Usage in ARGUS (Per Stage)
+### 3.7 — API Usage in ARGUS (Per Stage) — as actually implemented
 
 | ARGUS Stage | API Calls | Purpose |
 |---|---|---|
-| **DISCOVER** | `POST /v1/heatmap` (snapshot, real-time) | Scan city grid for current temperatures |
-| **DISCOVER** | `POST /v1/heatmap` (exceedance) | Find zones exceeding danger thresholds |
-| **INVESTIGATE** | `POST /v1/heatmap` (persistence) | Check how long anomalies have persisted |
-| **INVESTIGATE** | `POST /v1/heatmap` (historical) | Compare current to historical baseline |
-| **INVESTIGATE** | `POST /v1/heat-intelligence` | Deep-dive single point with 5 layers |
-| **UNDERSTAND** | `POST /v1/heat-intelligence` | Get land use, surface, risk context |
-| **RESPOND** | `POST /v1/heatmap` (predictive) | Forecast whether conditions will worsen |
+| **DISCOVER** | `POST /v1/heatmap` (tcm) per grid cell | Scan the city for current temperatures |
+| **DISCOVER** | `POST /v1/heatmap` (exceedance, once per scan) | City-wide threshold corroboration |
+| **INVESTIGATE** | `POST /v1/heatmap` (persistence) | Real hours-above-threshold for the anomaly |
+| **INVESTIGATE** | `POST /v1/env_params` | Real heat index, humidity, air quality |
+| **INVESTIGATE** | `POST /v1/satellite` | Real surface composition (building/road/vegetation %) |
+| **UNDERSTAND** | *(OpenStreetMap Overpass, not FortyGuard)* | Real infrastructure discovery |
+| **RESPOND** | *(Groq, `openai/gpt-oss-120b` — not FortyGuard)* | LLM-generated recommendations |
 
 ---
 
@@ -253,31 +268,33 @@ Continuously scan the city for thermal anomalies that require attention.
 ### API Calls
 
 ```python
-# Scan city grid with real-time snapshot
+# Scan city grid — Single Hour, current time (analytic_type defaults to "tcm")
 snapshot_payload = {
     "polygon_aoi": city_zone_polygon,
     "date_time": {
         "start_date": today,
         "start_time": current_hour,
-        "filter_type": 1  # real-time
+        "filter_type": 1  # Single Hour
     },
-    "granularity": 100
+    "granularity": 100  # must be 60, 80, or 100
 }
-# Submit and poll for each zone
+# Submit to POST /v1/heatmap, poll GET /v1/status/{id} for each zone
 ```
 
 ```python
-# Find danger zones with exceedance
+# Find danger zones — same /v1/heatmap endpoint, analytic_type="exceedance"
 exceedance_payload = {
     "polygon_aoi": city_zone_polygon,
     "date_time": {
         "start_date": today,
-        "start_time": current_hour,
-        "filter_type": 1
+        "filter_type": 3  # Single Day — no start_time needed
     },
     "granularity": 100,
-    # threshold parameters for exceedance analysis
+    "analytic_type": "exceedance",
+    "threshold": 40.0,   # °C
+    "direction": "above",
 }
+# result.stats_data.mean / result.map_data.features[].properties.value are in HOURS, not °C
 ```
 
 ### Anomaly Detection Algorithm
@@ -357,8 +374,8 @@ class AnomalyDetector:
 - **Auto-Scheduling:** Agent runs scans every 30 min / 1 hour automatically
 - **Priority Queue:** Anomalies ranked by severity for investigation order
 - **Historical Comparison:** Each scan compared against same-time-yesterday and 7-day average
-- **Predictive Pre-Scan:** Uses filter_type=3 to check if tomorrow will be worse
-- **Multi-City Support:** Configure multiple city polygons for parallel scanning
+- **Predictive Pre-Scan:** Query with `start_date` up to 12h ahead of now to check if conditions will worsen (forecast is just a future date, not a distinct filter_type)
+- **Multi-City Support:** ✅ built — 51 monitored cities (one per US state + DC), manually scanned per city to keep FortyGuard credit spend under explicit user control (see the National Overview map)
 - **Alert Thresholds:** Configurable per-city danger thresholds
 
 ---
@@ -368,107 +385,86 @@ class AnomalyDetector:
 ### Purpose
 Deep-dive into detected anomalies to understand their nature, duration, and trajectory.
 
-### What It Does
+### What It Does (as implemented — see `backend/argus_agent/src/services/agent_engine.py::investigate`)
 
-1. **Persistence Analysis** — How long has this anomaly been active?
-2. **Temporal Analysis** — Is it getting worse, stable, or improving?
-3. **Historical Context** — Has this happened before at this location?
-4. **Heat Intelligence Report** — Pull full 5-layer contextual report for the anomaly center
-5. **Expand Search Radius** — Check surrounding areas for spreading heat
+1. **Persistence Analysis** — real hours-above-threshold via FortyGuard, not a guess
+2. **Environmental Context** — real heat index, humidity, air quality via FortyGuard
+3. **Surface Analysis** — real land-cover composition (building/road/vegetation %) via FortyGuard's satellite segmentation
+4. **Temporal Trend** — WORSENING/STABLE, derived from the persistence hours
 
-### API Calls
+Historical baseline comparison and spreading/spatial analysis (below) remain aspirational —
+not built; they'd require additional API calls this pass deliberately avoided to keep
+per-anomaly cost and scan time bounded (see `fortyguard_heat_intelligence_api.md` §7).
+
+### API Calls (confirmed against the live API — see `fortyguard_heat_intelligence_api.md`)
 
 ```python
-# Check persistence — how many hours above threshold
+# Persistence — real hours above threshold, full day, for a tight polygon around the anomaly
 persistence_payload = {
-    "polygon_aoi": anomaly_zone_polygon,  # tight polygon around anomaly
-    "date_time": {
-        "start_date": today,
-        "start_time": "00:00",  # check full day
-        "filter_type": 1
-    },
-    "granularity": 50  # higher resolution for investigation
-}
-```
-
-```python
-# Pull Heat Intelligence Report for anomaly center point
-intelligence_payload = {
-    "location": {
-        "latitude": anomaly.lat,
-        "longitude": anomaly.lon
-    }
-}
-response = requests.post(
-    "https://api.fortyguard.com/v1/heat-intelligence",
-    headers=headers,
-    json=intelligence_payload
-)
-```
-
-```python
-# Compare to historical baseline (same date last week / last year)
-historical_payload = {
     "polygon_aoi": anomaly_zone_polygon,
-    "date_time": {
-        "start_date": "2026-08-15",  # last week
-        "start_time": "14:00",
-        "filter_type": 2  # historical
-    },
-    "granularity": 100
+    "date_time": {"start_date": today, "filter_type": 3},  # Single Day — no start_time needed
+    "granularity": 60,           # must be 60, 80, or 100
+    "analytic_type": "persistence",
+    "threshold": 40.0,           # °C
+    "direction": "above",
 }
+# response.result.stats_data.mean -> mean hours above threshold across the anomaly's tiles
 ```
 
-### INVESTIGATE Output
+```python
+# Real environmental context for the anomaly's exact point
+env_params_payload = {
+    "latitude": anomaly.lat,
+    "longitude": anomaly.lon,
+    "temperature": anomaly.temperature_c,
+    "date_time": {"start_date": today, "start_time": current_hour, "filter_type": 1},
+    "analysis": ["heat_index_celsius", "relative_humidity_percent", "air_quality:idx"],
+}
+response = requests.post("https://api.fortyguard.com/v1/env_params", headers=headers, json=env_params_payload)
+# response.result.locations[0].parameters -> {"heat_index_celsius": [39.6], ...}
+```
+
+```python
+# Real surface composition for the anomaly's surroundings (Premium)
+satellite_payload = {
+    "sat": {"latitude": anomaly.lat, "longitude": anomaly.lon},
+    "date_time": {"start_date": today, "start_time": current_hour, "filter_type": 1},
+    "granularity": 60,
+}
+response = requests.post("https://api.fortyguard.com/v1/satellite", headers=headers, json=satellite_payload)
+# response.result.segmentation.segments -> {"building": 83.6, "road, route": 13.8, ...}
+```
+
+### INVESTIGATE Output (real shape)
 
 ```json
 {
     "anomaly_id": "ANO-001",
     "investigation": {
-        "persistence": {
-            "hours_above_threshold": 6,
-            "started_at": "2026-08-22T08:00:00Z",
-            "trend": "WORSENING",
-            "peak_expected": "2026-08-22T15:30:00Z"
-        },
-        "historical_comparison": {
-            "same_time_last_week": 112,
-            "current": 118,
-            "deviation": "+6°F",
-            "is_unusual": true,
-            "historical_frequency": "occurs 3 times per summer"
-        },
-        "heat_intelligence": {
-            "land_use": "commercial_dense",
-            "surface_albedo": 0.15,
-            "vegetation_density": "very_low",
-            "risk_assessment": "EXTREME",
-            "contextual_factors": [
-                "Large parking lot with dark asphalt surface",
-                "Minimal tree canopy (<5% coverage)",
-                "High building density trapping heat",
-                "Limited nighttime cooling potential"
-            ]
-        },
-        "spatial_analysis": {
-            "anomaly_radius": "0.8 km",
-            "spreading": true,
-            "spread_direction": "northeast",
-            "affected_area_km2": 2.01
-        }
-    },
-    "recommendation": "ESCALATE_TO_UNDERSTAND"
+        "hours_above_threshold": 6.2,
+        "trend": "WORSENING",
+        "heat_index_f": 103,
+        "apparent_temperature_f": 105,
+        "wet_bulb_temperature_f": 74,
+        "humidity_percent": 21,
+        "air_quality_index": 61,
+        "surface_composition": {"building": 83.6, "road, route": 13.8, "others": 2.6},
+        "contextual_factors": [
+            "Heat index (feels like) 103°F",
+            "Relative humidity 21%",
+            "Air quality index 61",
+            "Surface composition: building 84%, road, route 14%"
+        ]
+    }
 }
 ```
 
 ### Features in INVESTIGATE
 
-- **Auto-Depth:** Agent decides how deep to investigate based on severity
-- **Persistence Tracking:** Tracks consecutive hours above threshold
-- **Trend Projection:** Simple ML model to predict next 6 hours
-- **Spreading Detection:** Compares anomaly boundaries over time
-- **Root Cause Hypothesis:** LLM reasons about contextual factors
-- **Comparison Engine:** Side-by-side with similar historical events
+- **Real persistence tracking** — actual hours above threshold from FortyGuard, not estimated
+- **Real environmental + surface context** — heat index, humidity, air quality, land cover
+- Aspirational (not built): auto-depth by severity, ML trend projection, spreading detection,
+  historical-baseline comparison, LLM root-cause hypothesis generation as a distinct sub-step
 
 ---
 
@@ -1180,7 +1176,7 @@ Open Data Portals ────────────────────�
 ### Component 3: LLM Reasoning Agent (Track 06)
 
 - **Type:** Agentic AI with tool use
-- **LLM:** Claude Sonnet or GPT-4o
+- **LLM:** Groq (`openai/gpt-oss-120b`)
 - **Tools Available to Agent:**
   - `scan_city(polygon)` → calls FortyGuard snapshot
   - `check_exceedance(polygon, threshold)` → calls FortyGuard exceedance
@@ -1266,13 +1262,13 @@ Open Data Portals ────────────────────�
 |---|---|---|
 | **Backend** | Python 3.12 + FastAPI | Fast async API, great for hackathon speed |
 | **Task Queue** | Celery + Redis | Background agent loop, periodic scanning |
-| **Database** | SQLite (dev) / PostgreSQL (prod) | Store anomalies, investigations, reports |
+| **Database** | MongoDB (pymongo) | Store anomalies, investigations, reports |
 | **Cache** | Redis | Cache API responses, reduce FortyGuard credit usage |
 | **Frontend** | React (Vite) + Tailwind CSS | Fast component-based UI with modern styling |
 | **Maps** | Mapbox GL JS + Deck.gl | High-performance heatmap rendering |
 | **Charts** | Recharts | Temperature timelines, risk charts |
 | **AI/ML** | scikit-learn + numpy | Anomaly detection, spatial statistics |
-| **LLM** | Claude API (Anthropic) | Agentic reasoning, report generation |
+| **LLM** | Groq (`openai/gpt-oss-120b`) | Agentic reasoning, report generation |
 | **Geospatial** | Shapely + GeoPandas | Polygon operations, spatial analysis |
 | **Real-time** | Socket.io | Live agent feed to frontend |
 | **Reports** | Jinja2 + ReportLab | HTML and PDF report generation |
