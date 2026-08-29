@@ -16,7 +16,7 @@ interface Props {
   lastScanMeta?: {
     cells_with_data: number;
     cells_scanned: number;
-    city_exceedance_zone_count?: number;
+    city_exceedance_zone_count?: number | null;
   };
 }
 
