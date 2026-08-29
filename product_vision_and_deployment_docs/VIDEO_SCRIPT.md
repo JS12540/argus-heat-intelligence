@@ -20,19 +20,23 @@
 
 ---
 
-## [1:00–1:45] City Command Center Walkthrough (screen share: click into a city, e.g. Kansas City)
+## [1:00–1:45] City Command Center Walkthrough (screen share: Phoenix, AZ)
 
-> Clicking into a city opens its Command Center. ARGUS just scanned a 3-by-3 grid across the city using FortyGuard's heatmap API, and here it is plotted on a real street map — each marker is the actual measured temperature at that location, colored on a blue-to-red danger gradient, labeled by neighborhood direction. Here it's telling me the hottest zone is North Kansas City at 89 degrees.
+> Let's open Phoenix, Arizona — currently flagged CRITICAL. Current temp: 105°F, an Extreme Heat alert, 7 active anomalies, 3 of them critical, and FortyGuard returned real data for all 9 of 9 grid cells.
 >
-> Below that, a 7-day temperature trend with fixed safety thresholds — so I can immediately see if this city is in genuinely dangerous territory, not just "warmer than usual."
+> ARGUS just scanned a 3-by-3 grid across the city using FortyGuard's heatmap API, and here it is plotted on a real street map — each marker is the actual measured temperature at that location, colored on a blue-to-red danger gradient. Right now the hottest zone is West Phoenix at 103°F.
 >
-> And here's the AI layer: I click Refresh Analysis, and Groq — an open-weights LLM — reads seven days of real temperature data and generates a heat-wave forecast: is this a heat wave, is it worsening, what's the 3-day peak, and a confidence score. This is a real API call happening live, not a canned response.
+> Below that, a 7-day temperature trend with fixed safety thresholds — this week Phoenix has stayed between 39 and 44 degrees Celsius, and ARGUS calls that out directly: "EXTREME — 5.4°C above safe threshold." Not just a line on a chart — a judgment call about danger.
+>
+> And here's the AI layer: Groq — an open-weights LLM — read those 7 days of real temperature data and came back with: yes, this is a confirmed heat wave, the trend is stable-to-worsening, and risk level is HIGH, with a 70% confidence score. This is a real API call happening live, not a canned response.
+>
+> And down here, Heat Zone Alerts — the three critical cells right now: heat index up to 48°C, humidity around 70%, and every one of them trending WORSENING. That's the difference between "it's hot" and "here's exactly where to send help."
 
 ---
 
 ## [1:45–2:15] How FortyGuard Powers This (screen share: anomaly list / logs)
 
-> Under the hood, every one of those grid cells is a real FortyGuard `/v1/heatmap` call — I'm using three analytic types: **tcm** for raw temperature, **exceedance** for how many hours a zone has been over threshold, and **persistence** for how long that's been sustained. That combination feeds a composite anomaly score that classifies each zone from INFO up to CRITICAL.
+> Under the hood, every one of those grid cells is a real FortyGuard `/v1/heatmap` call — I'm using four analytic types: **tcm** for raw temperature, **exceedance** for how many hours a zone has been over threshold, **persistence** for how long that's been sustained, and **time_of_measure** for when the peak hits. I'm also pulling `/v1/env_params` for heat index and humidity, and `/v1/satellite` for land-cover context. That combination feeds a composite anomaly score that classifies each zone from INFO up to CRITICAL — which is exactly why Phoenix's 3 worst cells are flagged CRITICAL right now, not just "warm."
 >
 > I built in rate limiting and MongoDB caching so repeat queries don't burn credits twice — and if FortyGuard ever runs low on credits mid-scan, ARGUS falls back transparently to structurally identical synthetic data, so the full pipeline stays demoable without live spend. That's disclosed openly in the logs — never silently faked.
 
