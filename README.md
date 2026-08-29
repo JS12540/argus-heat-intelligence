@@ -22,6 +22,7 @@ graph TB
     
     subgraph Backend["⚙️ Backend (FastAPI + Python)"]
         API["📡 REST API<br/>FastAPI Routes"]
+        Cron["⏰ APScheduler Cron<br/>Daily 2 AM UTC · all 51 cities<br/>(AUTO_SCAN_ENABLED=true)"]
         Agent["🤖 ARGUS Agent Pipeline<br/>DISCOVER→INVESTIGATE<br/>→UNDERSTAND→RESPOND"]
         LLM["🧠 LLM Integration<br/>Groq Heat Meteorologist"]
         Cache["💾 FortyGuard Cache<br/>MongoDB TTL 1 Hour"]
@@ -46,7 +47,9 @@ graph TB
     
     User -->|HTTP/REST| Frontend
     Frontend -->|API Calls| API
-    API -->|Scan Request| Agent
+    API -->|Scan Request<br/>one city, on demand| Agent
+    Cron -->|scan_all_cities_background<br/>every city, once daily| Agent
+    Cron -->|run_llm_trend_analysis<br/>every city, once daily| LLM
     Agent -->|Check/Store| Cache
     Agent -->|Analyze| LLM
     LLM -->|Store Results| Cache
@@ -193,36 +196,42 @@ frontend/
 
 ## 🔄 When & Why Dummy Data is Used
 
+Two independent triggers fall back to the same dummy-data generator — one checked once at
+startup, the other checked on every single FortyGuard call:
+
+```mermaid
+flowchart TD
+    Start(["Every FortyGuard call<br/>(DISCOVER / INVESTIGATE / cron)"]) --> KeyCheck{"FORTYGUARD_API_KEY<br/>configured?"}
+
+    KeyCheck -->|"No key at all"| Dummy
+    KeyCheck -->|"Key present"| Call["Call real FortyGuard API<br/>(submit-and-poll)"]
+
+    Call --> StatusCheck{"Response status?"}
+    StatusCheck -->|"200 OK"| Real["✅ Real temperature data<br/>cached in MongoDB"]
+    StatusCheck -->|"HTTP 402<br/>Insufficient credits"| Dummy
+    StatusCheck -->|"Other error"| Fail["❌ Scan fails for this cell<br/>(logged, doesn't crash the rest)"]
+
+    Dummy["🎭 Dummy data generator<br/>backend/dummy_data/services/fortyguard.py"] --> Shape["Same response shape as real API<br/>(stats_data / map_data)"]
+    Shape --> Realistic["Realistic per-city temperature ranges<br/>(CITY_TEMP_RANGES)"]
+    Realistic --> Logged["⚠️ Always logged —<br/>'FortyGuard out of credits, using dummy data'<br/>never silently substituted"]
+    Logged --> CacheIt["Cached in MongoDB<br/>(same fortyguard_cache collection)"]
+
+    Real --> Downstream["INVESTIGATE → UNDERSTAND → RESPOND<br/>proceed identically either way"]
+    CacheIt --> Downstream
+
+    style Dummy fill:#10b981,color:#fff
+    style Real fill:#f97316,color:#fff
+    style Fail fill:#ef4444,color:#fff
+    style Downstream fill:#4f46e5,color:#fff
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Startup                                  │
-└────────┬─────────────────────────────────────────────────────┘
-         │
-         ├─→ Check environment variable: FORTYGUARD_API_KEY
-         │
-    ┌────▼─────────────────────┐
-    │ Is API Key Set?          │
-    └────┬──────────────┬───────┘
-         │              │
-    YES  │              │  NO
-        │              │
-        ▼              ▼
-    ┌─────────────┐  ┌──────────────────────────────┐
-    │ Use Real    │  │ Use Dummy Data               │
-    │ FortyGuard  │  │ (backend/dummy_data/)        │
-    │ API         │  │                              │
-    └─────────────┘  └──────────────────────────────┘
-        │                        │
-        │                        │
-        ├─ Every DISCOVER       ├─ Generate realistic responses
-        │  scan makes real      │  (same structure as real API)
-        │  API calls ($$$)      │
-        │                        ├─ Cache in MongoDB
-        ├─ Uses rate limiting   │
-        │  (4 concurrent)       ├─ No credits consumed ✅
-        │                        │
-        └─ Real data in cache   └─ Perfect for demos! 🎬
-```
+
+**Path 1 — no key configured at all** (typical for a zero-credit demo setup, checked once):
+every call skips FortyGuard entirely. **Path 2 — key configured but credits ran out mid-scan**
+(the more common case once you're actively scanning — a single 9-cell city scan can cost
+1,000+ credits): `fortyguard_client.py::_submit_and_wait` catches the `HTTP 402` per-call, so one
+city running low doesn't take down the other 50 in a cron run. Either path, the rest of the
+DISCOVER→RESPOND pipeline — anomaly scoring, the live map, the AI forecast — runs identically,
+because the dummy response is structurally indistinguishable from a real one.
 
 **Use Case: Zero-Credit Demo Setup**
 ```bash
@@ -243,6 +252,14 @@ FORTYGUARD_API_KEY=xxxxx  # ← Real key
 # System automatically switches to real API
 # All other code unchanged ✅
 ```
+
+**A second, more common trigger: mid-scan credit exhaustion.** Even with a real key configured,
+FortyGuard bills per grid cell — a full 9-cell city scan can cost 1,000+ credits, and scanning
+all 51 cities daily (via the cron job above) burns through a free-tier key fast. When FortyGuard
+responds `HTTP 402 Insufficient credits`, `fortyguard_client.py::_submit_and_wait` catches that
+specific error and falls back to the same dummy-data generator — per-call, not globally — so one
+city running low on credits doesn't take down the other 50. This is always logged
+(`"FortyGuard out of credits, using dummy data"`), never silently substituted.
 
 ---
 
@@ -290,32 +307,93 @@ graph LR
 
 ---
 
-## ⏰ Cron Job (Auto-Scan)
+## ⏰ Cron Job vs. Manual Scan — What Runs When
 
-**Location**: `backend/argus_agent/main.py`
+ARGUS has two independent ways to trigger a scan, and they're **not** distinguished by time
+window (both use FortyGuard's Single Day analytic type — see note below) — they're
+distinguished by *what triggers them* and *what they do afterward*:
+
+| | **Manual "Run Scan Now"** | **Daily Cron (Auto-Scan)** |
+|---|---|---|
+| Trigger | User clicks a button, one city at a time | APScheduler, 2 AM UTC, all 51 cities |
+| Credit spend | Only what the user explicitly asks for | Bounded — 5 cities concurrently, all 51 daily |
+| After scanning | Just returns anomalies to the dashboard | **Also** runs a Groq trend analysis per city |
+| Enabled by | Always available | `AUTO_SCAN_ENABLED=true` env var |
+
+> **Why not a "live single-hour" mode for manual scans?** We tested this — FortyGuard's Single
+> Hour analytic type frequently misses the satellite pass and returns `n_cells: 0` even when the
+> date/hour are correctly aligned. A full-day mean is far more likely to have real coverage, so
+> both manual and cron scans deliberately use **Single Day** (see
+> `agent_engine.py::_read_zone_temperature`). "Manual" here means *on-demand*, not *shorter time
+> window* — the real-time part is that it's user-triggered right now, not that it queries a
+> narrower slice of the day.
+
+### One cron run, two datasets refreshed
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as ⏰ APScheduler<br/>(2 AM UTC daily)
+    participant Cron as scan_all_cities_background()
+    participant FG as 🌡️ FortyGuard API<br/>(or 🎭 dummy data if<br/>credits are exhausted)
+    participant Cache as 💾 fortyguard_cache
+    participant Agent as 🤖 DISCOVER→RESPOND<br/>(per city)
+    participant Groq as 🧠 Groq LLM
+    participant LLMDB as 💾 llm_analysis
+    participant Anomalies as 💾 anomalies
+
+    Scheduler->>Cron: fires once daily
+    Cron->>Cron: loop all 51 MONITORED_CITIES<br/>(max 5 concurrent)
+
+    loop for each city
+        Cron->>Agent: run_cycle(city_id)
+        Agent->>FG: Single Day heatmap query<br/>(9 grid cells)
+        alt FortyGuard has credits
+            FG-->>Cache: real temperature data cached
+        else HTTP 402 — out of credits
+            Note over FG,Cache: transparent fallback —<br/>same response shape,<br/>synthetic per-city temps
+            FG-->>Cache: dummy data cached (disclosed in logs)
+        end
+        Agent->>Anomalies: anomalies stored (severity scored)
+        Agent-->>Cron: scan done for this city
+
+        Cron->>Groq: run_llm_trend_analysis(city_id)<br/>reads 7 days from fortyguard_cache
+        Groq-->>LLMDB: heat-wave forecast + confidence stored
+        Note over Cron,Groq: independent try/except —<br/>a failed LLM call doesn't<br/>erase this city's scan results
+    end
+
+    Cron-->>Scheduler: "AUTO-SCAN completed: all 51 cities scanned"
+```
+
+**Why dummy data instead of failing the scan?** FortyGuard bills per grid cell, and a single
+9-cell city scan can cost 1,000+ credits — across 51 cities daily, a free-tier key runs out fast
+(`HTTP 402 Insufficient credits`). Rather than crash the cron mid-run, `fortyguard_client.py`
+catches that specific error and swaps in a structurally identical synthetic response (same
+`stats_data`/`map_data` shape, realistic per-city temperature ranges) — so the pipeline, the
+dashboard, and the LLM analysis all keep working end-to-end. This is always visible in the logs
+(`"FortyGuard out of credits, using dummy data"`) — never silently presented as real.
+
+**Location**: `backend/argus_agent/main.py` (scheduler + cron function),
+`backend/argus_agent/src/api/routes.py::run_llm_trend_analysis` (shared LLM logic — also used by
+the dashboard's on-demand "Refresh Analysis" button)
 
 ```python
-# APScheduler integration
-scheduler = AsyncIOScheduler()
+# main.py
+async def scan_all_cities_background() -> None:
+    for city_id in city_ids:                                  # max 5 concurrent
+        documents, meta = await argus_agent.run_cycle(collection, city_id)   # -> fortyguard_cache + anomalies
+        await run_llm_trend_analysis(city_id, days=7)                       # -> llm_analysis
 
-@app.on_event("startup")
-async def start_scheduler():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     if os.getenv("AUTO_SCAN_ENABLED") == "true":
-        # Daily scan at 2 AM UTC for all 51 cities
         scheduler.add_job(scan_all_cities_background, "cron", hour=2, minute=0)
         scheduler.start()
-
-async def scan_all_cities_background():
-    """Concurrently scan all 51 cities (5 at a time, respecting rate limits)"""
-    semaphore = asyncio.Semaphore(5)
-    # Scan all MONITORED_CITIES
-    # Results auto-stored in anomalies collection
 ```
 
 **Enable in Production**
 ```bash
 export AUTO_SCAN_ENABLED=true
-# Backend will now scan all 51 cities daily at 2 AM UTC
+# Backend will now scan all 51 cities AND refresh their AI forecasts daily at 2 AM UTC
 ```
 
 ---
